@@ -26,8 +26,17 @@ class ImageProcessor:
     # --- Initializes the model with the specified name and the preprocess function ---
     def load_imagenet_json(self, json_path):
         with open(json_path, "r") as f:
-            self.categories = json.load(f)
-        return self.categories
+            raw = json.load(f)
+        categories = [None] * len(raw)
+
+        for idx_str, pair in raw.items():
+            idx = int(idx_str)
+            wnid, class_name = pair
+            categories[idx] = class_name
+
+        self.categories = categories
+        return categories
+
 
     def initialize_model(self, model_name):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -102,11 +111,12 @@ class ImageProcessor:
             )
         return rows
     
-    def get_class_ranking(self, scores, class_index, categories):
+    def get_class_ranking(self, scores, class_index):
         probs = softmax(scores.squeeze(), dim=0).detach().cpu()
         ranking = torch.argsort(probs, descending=True)
-        rank = int((ranking == categories.index(class_index)).nonzero().item()) + 1
-        return rank, float(probs[categories.index(class_index)].item())
+        rank = int((ranking == class_index).nonzero().item()) + 1
+        prob = float(probs[class_index].item())
+        return rank, prob
 
     def analyse_image_CAM_with_layers(self,
             image_path,
@@ -123,7 +133,7 @@ class ImageProcessor:
         target_rank, target_prob = self.get_class_ranking(scores, target_idx)
         predicted_class_name = predicted_rows[0]["class_name"]
 
-        overlay = overlay_mask(to_pil_image(image), to_pil_image(activation_map, mode="F"), alpha=alpha)
+        overlay = overlay_mask(image, to_pil_image(activation_map, mode="F"), alpha=alpha)
         return {
             "image_path": image_path,
             "target_class_name": self.categories[target_idx],
@@ -148,9 +158,12 @@ class ImageProcessor:
                 scores = self.model(self.preprocess(results["image"]).unsqueeze(0).to(self.device))
                 activation_map = cam_extractor(self.find_class_index(results["target_class_name"]), scores)[0].detach().cpu()
             
-            overlay = overlay_mask(to_pil_image(results["image"]), to_pil_image(activation_map, mode="F"), alpha=alpha)
+            activation_map_2d = activation_map.squeeze()
+
+            overlay = overlay_mask(results["image"],
+                                    to_pil_image(activation_map_2d, mode="F"), alpha=alpha)
             
-            ax.imshow(overlay, results["activation_map"], cmap="jet")
+            ax.imshow(overlay)
             ax.set_title(f"{layer_name} Activation Map")
             ax.axis("off")
 
