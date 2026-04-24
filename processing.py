@@ -1,6 +1,5 @@
 # --- Imports libraries ---
 from pathlib import Path
-from xml.parsers.expat import model
 import torch
 from PIL import Image
 from torchvision import transforms
@@ -84,29 +83,16 @@ class ImageProcessor:
     def top_k_from_scores(self, scores, k=5):
         categories = self.categories
         probs = softmax(scores.squeeze(), dim=0).detach().cpu()
+        logits = scores.squeeze().detach().cpu()
         values, indices = torch.topk(probs, k)
         rows = []
-        for value, idx in zip(values, indices):
+        for prob, idx in zip(values, indices):
             rows.append(
                 {
                     "class_index": idx.item(),
                     "class_name": categories[idx.item()],
-                    "probability": value.item(),
-                }
-            )
-        return rows
-    
-    def top_k_logits(self, scores, k=10):
-        categories = self.categories
-        logits = scores.squeeze().detach().cpu()
-        values, indices = torch.topk(logits, k)
-        rows = []
-        for value, idx in zip(values, indices):
-            rows.append(
-                {
-                    "class_index": idx.item(),
-                    "class_name": categories[idx.item()],
-                    "logit": value.item(),
+                    "probability": prob.item(),
+                    "logit": logits[idx.item()].item(),
                 }
             )
         return rows
@@ -141,7 +127,6 @@ class ImageProcessor:
             "target_rank": target_rank,
             "target_probability": target_prob,
             "top5_predictions": predicted_rows,
-            "top10_logits": self.top_k_logits(scores, k=10),
             "image": image,
             "activation_map": activation_map,
             "overlay": overlay,
@@ -153,18 +138,117 @@ class ImageProcessor:
         axes[0].set_title(f"Original Image\n(Target: {results['target_class_name']})")
         axes[0].axis("off")
 
+        batch = self.preprocess(results["image"]).unsqueeze(0).to(self.device)
+
         for ax, layer_name in zip(axes[1:], layers_name):
             with LayerCAM(self.model, target_layer=layer_name) as cam_extractor:
-                scores = self.model(self.preprocess(results["image"]).unsqueeze(0).to(self.device))
+                scores = self.model(batch)
+                probs = softmax(scores.squeeze(), dim=0).detach().cpu()
+
+                predicted_idx = torch.argmax(probs).item()
+                predicted_class_name = self.categories[predicted_idx]
+                predicted_probability = probs[predicted_idx].item()
+                predicted_logits = scores.squeeze().detach().cpu()
+
                 activation_map = cam_extractor(self.find_class_index(results["target_class_name"]), scores)[0].detach().cpu()
             
             activation_map_2d = activation_map.squeeze()
 
             overlay = overlay_mask(results["image"],
                                     to_pil_image(activation_map_2d, mode="F"), alpha=alpha)
+            layer_explanation = {
+                "layer1": "Low‑level features (edges, colors, textures)",
+                "layer3": "Mid‑level features (shapes, parts, contours)",
+                "layer4": "High‑level features (object‑level regions)"
+            }
             
             ax.imshow(overlay)
-            ax.set_title(f"{layer_name} Activation Map")
+            ax.set_title(f"LayerCAM - {layer_name} Activation Map\n"
+                         f"Explanation: {layer_explanation.get(layer_name)}\n"
+                         f"Predicted: {predicted_class_name}\n"
+                         f"Class Index: {predicted_idx}\n"
+                         f"Probability: {predicted_probability:.4f}\n"
+                         f"Logit: {predicted_logits[predicted_idx]:.4f}"
+                         )
+            ax.axis("off")
+
+        plt.tight_layout()
+        plt.show()
+
+        print(f"Filename: {results['image_path'].name}")
+        print(f"Target Class: {results['target_class_name']}")
+        print(f"Predicted Class: {results['predicted_class_name']}")
+        print(f"Target Class Rank: {results['target_rank']}")
+        print(f"Target Class Probability: {results['target_probability']:.4f}")
+        print("\nTop 5 Predictions:")
+        for idx, row in enumerate(results["top5_predictions"], 1):
+            print(f"{idx}. {row['class_name']} (Index: {row['class_index']}, Probability: {row['probability']:.4f})")
+
+    def analyse_UNKNOWN_image_CAM_with_layers(self,
+            image_path,
+            alpha=0.5):
+        image, batch = self.process_image(image_path)
+
+        with LayerCAM(self.model) as cam_extractor:
+            scores = self.model(batch)
+            probs = softmax(scores.squeeze(), dim=0).detach().cpu()
+            predicted_idx = torch.argmax(probs).item()
+            activation_map = cam_extractor(predicted_idx, scores)[0].detach().cpu()
+        
+        predicted_rows = self.top_k_from_scores(scores, k=5)
+        target_rank, target_prob = self.get_class_ranking(scores, predicted_idx)
+        predicted_class_name = predicted_rows[0]["class_name"]
+
+        overlay = overlay_mask(image, to_pil_image(activation_map, mode="F"), alpha=alpha)
+        return {
+            "image_path": image_path,
+            "target_class_name": self.categories[predicted_idx],
+            "predicted_class_name": predicted_class_name,
+            "target_rank": target_rank,
+            "target_probability": target_prob,
+            "top5_predictions": predicted_rows,
+            "image": image,
+            "activation_map": activation_map,
+            "overlay": overlay,
+        }
+    
+    def display_cam_results_UNKNOWN(self, results, layers_name=["layer1", "layer3", "layer4"], alpha=0.4):
+        fig, axes = plt.subplots(1, len(layers_name) + 1, figsize=(5 * (len(layers_name) + 1), 5))
+        axes[0].imshow(results["image"])
+        axes[0].set_title("Original Image\n(Target: Unknown)")
+        axes[0].axis("off")
+
+        batch = self.preprocess(results["image"]).unsqueeze(0).to(self.device)
+
+        for ax, layer_name in zip(axes[1:], layers_name):
+            with LayerCAM(self.model, target_layer=layer_name) as cam_extractor:
+                scores = self.model(batch)
+                probs = softmax(scores.squeeze(), dim=0).detach().cpu()
+
+                predicted_idx = torch.argmax(probs).item()
+                predicted_class_name = self.categories[predicted_idx]
+                predicted_probability = probs[predicted_idx].item()
+                predicted_logits = scores.squeeze().detach().cpu()
+
+                activation_map = cam_extractor(self.find_class_index(results["target_class_name"]), scores)[0].detach().cpu()
+            
+            activation_map_2d = activation_map.squeeze()
+
+            overlay = overlay_mask(results["image"],
+                                    to_pil_image(activation_map_2d, mode="F"), alpha=alpha)
+            layer_explanation = {
+                "layer1": "Low‑level features (edges, colors, textures)",
+                "layer3": "Mid‑level features (shapes, parts, contours)",
+                "layer4": "High‑level features (object‑level regions)"
+            }
+            ax.imshow(overlay)
+            ax.set_title(f"LayerCAM - {layer_name} Activation Map\n"
+                         f"Explanation: {layer_explanation.get(layer_name)}\n"
+                         f"Predicted: {predicted_class_name}\n"
+                         f"Class Index: {predicted_idx}\n"
+                         f"Probability: {predicted_probability:.4f}\n"
+                         f"Logit: {predicted_logits[predicted_idx]:.4f}"
+                         )
             ax.axis("off")
 
         plt.tight_layout()
